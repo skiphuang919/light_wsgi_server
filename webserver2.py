@@ -1,6 +1,10 @@
 import socket
 import StringIO
 import sys
+import os
+import signal
+import errno
+import time
 
 
 class WSGIServer(object):
@@ -39,14 +43,49 @@ class WSGIServer(object):
     def set_app(self, app):
         self.application = app
 
+    @staticmethod
+    def signal_handler(signum, frame):
+        while True:
+            try:
+                # wait for completion of all child processes
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except OSError:
+                return
+            if pid == 0:
+                return
+
     def serve_forever(self):
-        listen_socket = self.listen_socket
+        # catch the child process exit signal and take action
+        signal.signal(signal.SIGCHLD, self.signal_handler)
+
         while True:
             # New client connection
-            self.client_connection, client_address = listen_socket.accept()
-            # Handle one request and close the client connection. Then
-            # loop over to wait for another client connection
-            self.handle_one_request()
+            try:
+                self.client_connection, client_address = self.listen_socket.accept()
+            except IOError as ex:
+                code, msg = ex.args
+                # parent process will be interrupted to deal with SIGCHLD signal
+                # it can not accept request again
+                # it will throw IOError with EINTR error code
+                if code == errno.EINTR:
+                    # cache the EINTR error code and re-accept request
+                    continue
+                else:
+                    raise
+
+            # Handle request concurrency
+            pid = os.fork()
+            if pid == 0:
+                # child process
+                # close the listen socket cause this is parent process's job
+                self.listen_socket.close()
+                self.handle_one_request()
+                # child process exit
+                os._exit(0)
+            else:
+                # parent process
+                # close the copied client connection cause this is child process' job
+                self.client_connection.close()
 
     def handle_one_request(self):
         self.request_data = request_data = self.client_connection.recv(1024)
@@ -126,6 +165,7 @@ class WSGIServer(object):
             self.client_connection.sendall(response)
         finally:
             self.client_connection.close()
+            time.sleep(30)
 
 
 SERVER_ADDRESS = (HOST, PORT) = '', 8888
